@@ -1,1 +1,10 @@
+{
+  "version": 2,
+  "functions": { "api/*.js": { "runtime": "nodejs18.x" } },
+  "routes": [
+    { "src": "/public/(.*)", "dest": "/api/index.js" },
+    { "src": "/api/(.*)", "dest": "/api/index.js" },
+    { "src": "/(.*)", "status": 404, "dest": "/api/index.js" }
+  ]
+}
 
