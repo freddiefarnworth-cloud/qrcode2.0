@@ -24,15 +24,23 @@ async function ensureMonthlyCodes(supa, userId, mk) {
     { label: "Free Beer/Coffee", policy: "hide_on_redeem" }
   ];
   for (const def of defs) {
-    const { data: exists } = await supa
+    const { data: exists, error: selErr } = await supa
       .from("codes").select("id")
       .eq("user_id", userId).eq("month_key", mk).eq("display_policy", def.policy)
       .maybeSingle();
+    if (selErr) {
+      console.error("ensureMonthlyCodes select error", { userId, mk, policy: def.policy }, selErr);
+      throw selErr;
+    }
     if (!exists) {
-      await supa.from("codes").insert({
+      const { error: insErr } = await supa.from("codes").insert({
         user_id: userId, code: genCode(), month_key: mk,
         benefit_label: def.label, display_policy: def.policy
       });
+      if (insErr) {
+        console.error("ensureMonthlyCodes insert error", { userId, mk, policy: def.policy }, insErr);
+        throw insErr;
+      }
     }
   }
 }
@@ -41,15 +49,28 @@ async function ensureMonthlyCodes(supa, userId, mk) {
 async function apiMyCodes(req, res, supa, url) {
   const email = url.searchParams.get("email");
   if (!email) return res.status(400).json({ error: "missing_email" });
-  const { data: user } = await supa.from("users").select("*").eq("email", email).single();
+  const { data: user, error: userErr } = await supa.from("users").select("*").eq("email", email).single();
+  if (userErr) {
+    console.error("apiMyCodes fetch user error", { email }, userErr);
+    return res.status(500).json({ error: "db_error" });
+  }
   if (!user) return res.status(403).json({ error: "unknown_member" });
   if (user.active_until < todayUtc()) return res.json({ codes: [], reason: "inactive_membership" });
 
   const mk = monthKey();
-  await ensureMonthlyCodes(supa, user.id, mk);
+  try {
+    await ensureMonthlyCodes(supa, user.id, mk);
+  } catch (e) {
+    console.error("apiMyCodes ensureMonthlyCodes error", { userId: user.id, mk }, e);
+    return res.status(500).json({ error: "db_error" });
+  }
 
-  const { data: rows } = await supa.from("codes").select("*").eq("user_id", user.id).eq("month_key", mk);
-  const out = rows
+  const { data: rows, error: rowsErr } = await supa.from("codes").select("*").eq("user_id", user.id).eq("month_key", mk);
+  if (rowsErr) {
+    console.error("apiMyCodes fetch codes error", { userId: user.id, mk }, rowsErr);
+    return res.status(500).json({ error: "db_error" });
+  }
+  const out = (rows || [])
     .filter(r => r.display_policy === "always_show" || !r.redeemed_at)
     .map(r => ({ code: r.code, benefit_label: r.benefit_label, display_policy: r.display_policy, month_key: r.month_key }));
   res.json({ codes: out });
@@ -58,7 +79,11 @@ async function apiMyCodes(req, res, supa, url) {
 async function apiValidate(req, res, supa, url) {
   const code = url.searchParams.get("code");
   if (!code) return res.status(400).json({ error: "missing_code" });
-  const { data: row } = await supa.from("codes").select("*, users(*)").eq("code", code).single();
+  const { data: row, error: rowErr } = await supa.from("codes").select("*, users(*)").eq("code", code).single();
+  if (rowErr) {
+    console.error("apiValidate fetch code error", { code }, rowErr);
+    return res.status(500).json({ valid:false, error: "db_error" });
+  }
   if (!row) return res.status(404).json({ valid: false, reason: "not_found" });
   if (row.users.active_until < todayUtc()) return res.status(403).json({ valid:false, reason:"inactive" });
 
@@ -78,8 +103,11 @@ async function apiRedeem(req, res, supa, body) {
   }
   const { code, discount_type, discount_value, gross_amount = 0, till_txn_id = null, staff_id = null, store_id = null } = body || {};
   if (!code || !discount_type || discount_value == null) return res.status(400).json({ ok:false, error:"missing_fields" });
-
-  const { data: row } = await supa.from("codes").select("*, users(*)").eq("code", code).single();
+  const { data: row, error: rowErr } = await supa.from("codes").select("*, users(*)").eq("code", code).single();
+  if (rowErr) {
+    console.error("apiRedeem fetch code error", { code }, rowErr);
+    return res.status(500).json({ ok:false, error:"db_error" });
+  }
   if (!row) return res.status(404).json({ ok:false, error:"not_found" });
   if (row.users.active_until < todayUtc()) return res.status(403).json({ ok:false, error:"inactive" });
 
@@ -106,19 +134,38 @@ async function apiRedeem(req, res, supa, body) {
     discount_type, discount_value, amount_saved: saved, till_txn_id
   };
   // insert redemption (idempotency by (code_id, till_txn_id))
-  const ins = await supa.from("redemptions").insert(red).select("*");
-  if (!ins.error && row.display_policy === "hide_on_redeem") {
-    await supa.from("codes").update({ redeemed_at: new Date().toISOString() }).eq("id", row.id);
-  } else if (!ins.error && row.display_policy === "always_show") {
-    await supa.from("codes").update({ redemption_count: row.redemption_count + 1 }).eq("id", row.id);
+  const { error: insErr } = await supa.from("redemptions").insert(red).select("*");
+  if (insErr) {
+    console.error("apiRedeem insert redemption error", { code, user_id: row.user_id }, insErr);
+    return res.status(500).json({ ok:false, error:"db_error" });
+  }
+  if (row.display_policy === "hide_on_redeem") {
+    const { error: updErr } = await supa
+      .from("codes").update({ redeemed_at: new Date().toISOString() }).eq("id", row.id);
+    if (updErr) {
+      console.error("apiRedeem update code redeemed_at error", { codeId: row.id }, updErr);
+      return res.status(500).json({ ok:false, error:"db_error" });
+    }
+  } else if (row.display_policy === "always_show") {
+    const { error: updErr } = await supa
+      .from("codes").update({ redemption_count: row.redemption_count + 1 }).eq("id", row.id);
+    if (updErr) {
+      console.error("apiRedeem increment redemption_count error", { codeId: row.id }, updErr);
+      return res.status(500).json({ ok:false, error:"db_error" });
+    }
   }
 
   // summaries (RPC if present, else fallback)
-  let monthSum = null, allSum = null;
-  try {
-    monthSum = (await supa.rpc("sum_savings_period", { p_user_id: row.user_id, p_period: "this_month" })).data;
-    allSum   = (await supa.rpc("sum_savings_period", { p_user_id: row.user_id, p_period: "all_time" })).data;
-  } catch(_) {}
+  const { data: monthSum, error: monthErr } = await supa.rpc("sum_savings_period", { p_user_id: row.user_id, p_period: "this_month" });
+  if (monthErr) {
+    console.error("apiRedeem month summary error", { user_id: row.user_id }, monthErr);
+    return res.status(500).json({ ok:false, error:"db_error" });
+  }
+  const { data: allSum, error: allErr } = await supa.rpc("sum_savings_period", { p_user_id: row.user_id, p_period: "all_time" });
+  if (allErr) {
+    console.error("apiRedeem all-time summary error", { user_id: row.user_id }, allErr);
+    return res.status(500).json({ ok:false, error:"db_error" });
+  }
   res.json({ ok:true, amount_saved: saved, currency: process.env.DEFAULT_CURRENCY || "GBP",
              this_month: monthSum || { uses:0, saved:0 }, all_time: allSum || { uses:0, saved:0 } });
 }
