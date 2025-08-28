@@ -1,5 +1,8 @@
 import { createClient } from "@supabase/supabase-js";
 import { randomUUID } from "crypto";
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 /** ========= helpers ========= */
 function getSupabase() {
@@ -164,7 +167,7 @@ function serveWidgetJS(res) {
         card.append(h("p",{style:"font-size:12px;opacity:0.8;text-align:center;margin-top:8px"},badge));
         const url=location.origin.replace(/\\/$/,'')+"/redeem?code="+encodeURIComponent(c.code);
         try{
-          const m=await import("https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js");
+          const m=await import(new URL("./qrcode.min.js", s.src).href);
           const canvas=document.createElement("canvas"); canv.append(canvas);
           await m.default.toCanvas(canvas, url, { width:200, margin:1 });
         }catch(e){ canv.append(h("a",{href:url}, "Open redemption link")); }
@@ -257,6 +260,14 @@ init();
 </body></html>`);
 }
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function serveQRCodeJS(res) {
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  const file = readFileSync(join(__dirname, "../public/qrcode.min.js"), "utf8");
+  res.end(file);
+}
+
 /** ========= main export ========= */
 export default async function handler(req, res) {
   cors(res);
@@ -279,6 +290,7 @@ export default async function handler(req, res) {
 
     // Static assets
     if (path === "/public/widget.js") return serveWidgetJS(res);
+    if (path === "/public/qrcode.min.js") return serveQRCodeJS(res);
     if (path === "/public/redeem.html") return serveRedeemHTML(res);
 
     // Default 404
